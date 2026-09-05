@@ -6,7 +6,7 @@ Group video calling built with [mediasoup](https://mediasoup.org) (SFU), Node.js
 
 - `server/` — Express + Socket.IO signaling server and mediasoup media server
 - `client/` — Next.js app: landing page (group id + name) and the call room
-- `deploy/` — Docker Compose + Caddy (HTTPS) setup and the [Oracle Cloud deployment guide](deploy/README.md)
+- `deploy/` — Docker Compose + Caddy (HTTPS) setup with deployment guides for [AWS EC2](deploy/EC2.md) and [Oracle Cloud](deploy/README.md)
 
 ## Running locally
 
