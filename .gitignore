@@ -1,0 +1,30 @@
+# dependencies
+node_modules/
+
+# builds
+dist/
+.next/
+out/
+build/
+*.tsbuildinfo
+
+# environment files (deploy/.env holds the real server IP and origins)
+.env
+.env.local
+.env.*.local
+!.env.example
+
+# logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# testing
+coverage/
+
+# platform / tooling
+.vercel
+.DS_Store
+*.pem
