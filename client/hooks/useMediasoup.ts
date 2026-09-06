@@ -56,6 +56,7 @@ export function useMediasoup() {
   const [micOn, setMicOn] = useState(false);
   const [camOn, setCamOn] = useState(false);
   const [screenSharing, setScreenSharing] = useState(false);
+  const [localScreenStream, setLocalScreenStream] = useState<MediaStream | null>(null);
   const clientRef = useRef<RoomClient | null>(null);
   const localStreamRef = useRef<MediaStream | null>(null);
   const screenStreamRef = useRef<MediaStream | null>(null);
@@ -217,6 +218,7 @@ export function useMediasoup() {
     setPeerStates(new Map());
     setJoined(false);
     setScreenSharing(false);
+    setLocalScreenStream(null);
     micOnRef.current = false;
     setMicOn(false);
     setCamOn(false);
@@ -288,6 +290,7 @@ export function useMediasoup() {
   const stopScreenShare = useCallback(async (): Promise<void> => {
     screenStreamRef.current?.getTracks().forEach((track) => track.stop());
     screenStreamRef.current = null;
+    setLocalScreenStream(null);
     setScreenSharing(false);
     await clientRef.current?.closeProducer('screen');
   }, []);
@@ -316,6 +319,7 @@ export function useMediasoup() {
       track.addEventListener('ended', () => void stopScreenShare());
       screenStreamRef.current = displayStream;
       await client.produceTrack('screen', track);
+      setLocalScreenStream(displayStream);
       setScreenSharing(true);
     } catch (shareError) {
       if (shareError instanceof Error && shareError.name !== 'NotAllowedError') {
@@ -358,6 +362,7 @@ export function useMediasoup() {
     micOn,
     camOn,
     screenSharing,
+    localScreenStream,
     join,
     leave,
     toggleMic,

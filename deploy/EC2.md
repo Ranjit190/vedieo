@@ -96,9 +96,51 @@ Redeploy the frontend. Done — open the Vercel URL on two devices and join the 
 - **Socket connection blocked / CORS errors in console**: `CLIENT_ORIGIN` doesn't exactly match the Vercel URL (no trailing slash), or the frontend still points at an old backend URL — remember `NEXT_PUBLIC_*` requires a Vercel redeploy to take effect.
 - **Live media state**: `https://<domain>/debug/rooms` shows every room, producer and consumer with RTP stats.
 
-## Updating after code changes
+## Deploying code updates (backend + frontend)
+
+Follow this whenever the app's code changed (new features, fixes) and both EC2 and Vercel need the new version.
+
+### Step 1 — Push the changes (local machine)
 
 ```bash
-cd vedio-call && git pull
-cd deploy && docker compose up -d --build
+cd vedio-call
+git add -A
+git commit -m "feat: <describe the change>"
+git push
 ```
+
+### Step 2 — Update the backend (EC2)
+
+```bash
+ssh -i your-key.pem ubuntu@<elastic-ip>
+cd vedio-call
+git pull
+cd deploy
+docker compose up -d --build
+```
+
+`up -d --build` rebuilds the image with the new code and swaps the running container; the rebuild reuses cached layers, so it is fast unless `package.json` changed (a dependency change re-runs `npm ci`, and on this instance that can re-compile the mediasoup worker — allow 10–20 minutes).
+
+Verify the new backend:
+
+```bash
+docker compose ps                       # media-server should be "running (healthy)"
+docker compose logs --tail 20 media-server
+curl https://<your-domain>/health       # → {"status":"ok"}
+```
+
+Ongoing calls are dropped during the swap (~a few seconds of downtime) — participants just rejoin.
+
+### Step 3 — Update the frontend (Vercel)
+
+Nothing to do in most cases: **Vercel auto-deploys every push to the main branch** (step 1 already triggered it). Check the deployment status under the project's **Deployments** tab; the new version is live when the latest deployment shows "Ready".
+
+Manual redeploy is only needed when an **environment variable** changed (e.g. a new `NEXT_PUBLIC_SERVER_URL`): Settings → Environment Variables → edit, then Deployments → ⋯ on the latest → **Redeploy** (env values are baked in at build time).
+
+### Step 4 — Confirm end to end
+
+1. Open the Vercel URL in two browsers/devices (hard-refresh: Ctrl+Shift+R, so no old bundle is cached)
+2. Join the same group id and check the changed behavior works over the deployed setup
+3. `https://<your-domain>/debug/rooms` shows the live producers/consumers if media needs inspecting
+
+**Order tip:** deploy the backend (step 2) before or together with the frontend. When a change touches the signaling protocol on both sides — new events or payload fields — an old backend with a new frontend (or the reverse) can misbehave until both are updated.
