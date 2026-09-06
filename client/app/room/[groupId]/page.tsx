@@ -54,7 +54,7 @@ function RoomContent() {
   }
 
   return (
-    <main className="room">
+    <main className={joined ? 'room in-call' : 'room'}>
       <header className="room-header">
         <h2>Group: {groupId}</h2>
         {joined && (

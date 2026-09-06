@@ -36,7 +36,21 @@ function MicOffIcon() {
 export default function PeerVideo(props: PeerVideoProps) {
   const { stream, name, muted = false, mirrored = false, micMuted = false, camOff = false, isScreen = false } = props;
   const videoRef = useRef<HTMLVideoElement>(null);
+  const containerRef = useRef<HTMLDivElement>(null);
   const [blocked, setBlocked] = useState(false);
+
+  /**
+   * Toggles browser fullscreen on this tile (Meet-style expand for screen
+   * shares).
+   * @returns {void}
+   */
+  function toggleFullscreen(): void {
+    if (document.fullscreenElement) {
+      document.exitFullscreen().catch(() => {});
+      return;
+    }
+    containerRef.current?.requestFullscreen().catch(() => {});
+  }
   const hasVideo = Boolean(stream && stream.getVideoTracks().length > 0);
   const showAvatar = !isScreen && (camOff || !hasVideo);
   const initial = (name.trim().charAt(0) || '?').toUpperCase();
@@ -63,7 +77,12 @@ export default function PeerVideo(props: PeerVideoProps) {
   }, [stream, play]);
 
   return (
-    <div className={isScreen ? 'peer-tile screen-tile' : 'peer-tile'}>
+    <div ref={containerRef} className={isScreen ? 'peer-tile screen-tile' : 'peer-tile'}>
+      {isScreen && (
+        <button type="button" className="fullscreen-btn" onClick={toggleFullscreen} title="Toggle fullscreen">
+          ⛶
+        </button>
+      )}
       <video
         ref={videoRef}
         autoPlay
