@@ -1,28 +1,49 @@
 'use client';
 
 import PeerVideo from '@/components/PeerVideo';
-import { RemotePeer } from '@/hooks/useMediasoup';
+import { PeerAVState, RemoteTile } from '@/hooks/useMediasoup';
 
 interface VideoGridProps {
   localStream: MediaStream | null;
   localName: string;
-  remotePeers: RemotePeer[];
+  micOn: boolean;
+  camOn: boolean;
+  tiles: RemoteTile[];
+  peerStates: Map<string, PeerAVState>;
 }
 
 /**
- * Lays out the local preview and all remote participants in a responsive
- * grid.
- * @param {VideoGridProps} props - Local stream/name and remote peer list.
+ * Lays out the local preview and every remote tile (peer cameras and screen
+ * shares) in a responsive grid. Muted peers show an avatar and a muted-mic
+ * badge instead of a black rectangle; screen shares span the full row.
+ * @param {VideoGridProps} props - Local state and remote tiles with per-peer mute states.
  * @returns {JSX.Element} The video grid.
  */
 export default function VideoGrid(props: VideoGridProps) {
-  const { localStream, localName, remotePeers } = props;
+  const { localStream, localName, micOn, camOn, tiles, peerStates } = props;
   return (
     <div className="video-grid">
-      <PeerVideo stream={localStream} name={`${localName} (you)`} muted mirrored />
-      {remotePeers.map((peer) => (
-        <PeerVideo key={peer.peerId} stream={peer.stream} name={peer.name} />
-      ))}
+      <PeerVideo
+        stream={localStream}
+        name={`${localName} (you)`}
+        muted
+        mirrored
+        micMuted={!micOn}
+        camOff={!camOn}
+      />
+      {tiles.map((tile) => {
+        const state = peerStates.get(tile.peerId);
+        return (
+          <PeerVideo
+            key={tile.tileKey}
+            stream={tile.stream}
+            name={tile.isScreen ? `${tile.name} (screen)` : tile.name}
+            isScreen={tile.isScreen}
+            micMuted={!tile.isScreen && Boolean(state?.micMuted)}
+            camOff={!tile.isScreen && Boolean(state?.camOff)}
+          />
+        );
+      })}
     </div>
   );
 }

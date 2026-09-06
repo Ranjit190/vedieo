@@ -14,6 +14,7 @@ async function buildPeerReport(peer: Peer): Promise<object> {
     producers.push({
       id: producer.id,
       kind: producer.kind,
+      source: producer.appData.source,
       paused: producer.paused,
       score: producer.score,
       stats: await producer.getStats()
@@ -24,8 +25,11 @@ async function buildPeerReport(peer: Peer): Promise<object> {
     consumers.push({
       id: consumer.id,
       kind: consumer.kind,
+      type: consumer.type,
       paused: consumer.paused,
       producerPaused: consumer.producerPaused,
+      preferredLayers: consumer.preferredLayers,
+      currentLayers: consumer.currentLayers,
       score: consumer.score
     });
   }

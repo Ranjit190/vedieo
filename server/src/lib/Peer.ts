@@ -87,6 +87,22 @@ export default class Peer {
   }
 
   /**
+   * Closes and removes one of this peer's producers (e.g. when a screen
+   * share stops). Consumers of it are closed automatically by mediasoup.
+   * @param {string} producerId - The producer id.
+   * @returns {boolean} True when the producer existed and was closed.
+   */
+  closeProducer(producerId: string): boolean {
+    const producer = this.producers.get(producerId);
+    if (!producer) {
+      return false;
+    }
+    producer.close();
+    this.producers.delete(producerId);
+    return true;
+  }
+
+  /**
    * Returns all active consumers of this peer.
    * @returns {types.Consumer[]} The peer's consumers.
    */

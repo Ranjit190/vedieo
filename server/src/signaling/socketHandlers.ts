@@ -16,6 +16,42 @@ export interface ServerContext {
 
 type Callback = (response: Record<string, unknown>) => void;
 
+const FULL_QUALITY_MAX_PEERS = 2;
+const MID_QUALITY_MAX_PEERS = 4;
+
+/**
+ * Picks the simulcast spatial layer viewers should receive based on room
+ * size: full quality for 1:1 calls, medium for small groups, lowest for
+ * large grids where every tile is rendered small anyway.
+ * @param {number} peerCount - Number of peers currently in the room.
+ * @returns {number} The preferred spatial layer (0 = lowest, 2 = highest).
+ */
+function preferredSpatialLayer(peerCount: number): number {
+  if (peerCount <= FULL_QUALITY_MAX_PEERS) {
+    return 2;
+  }
+  return peerCount <= MID_QUALITY_MAX_PEERS ? 1 : 0;
+}
+
+/**
+ * Re-applies the preferred simulcast layer on every video consumer in a
+ * room. Called when the room size changes so quality scales with grid size.
+ * @param {Room} room - The room to update.
+ * @returns {void}
+ */
+function updatePreferredLayers(room: Room): void {
+  const spatialLayer = preferredSpatialLayer(room.getPeers().length);
+  room.getPeers().forEach((peer) => {
+    peer.getConsumers().forEach((consumer) => {
+      if (consumer.kind === 'video' && consumer.type === 'simulcast') {
+        consumer.setPreferredLayers({ spatialLayer, temporalLayer: 2 }).catch((error: Error) => {
+          console.error(`Failed to set preferred layers: ${error.message}`);
+        });
+      }
+    });
+  });
+}
+
 /**
  * Wraps an async socket handler so any thrown error is returned to the
  * client through the acknowledgement callback instead of crashing the server.
@@ -103,6 +139,7 @@ async function handleJoinRoom(context: ServerContext, socket: Socket, data: { gr
     producers: room.getProducerList(socket.id),
     peers
   });
+  updatePreferredLayers(room);
   console.log(`Peer "${name}" [${socket.id}] joined group "${groupId}"`);
 }
 
@@ -145,31 +182,55 @@ async function handleConnectTransport(context: ServerContext, socket: Socket, da
   callback({ connected: true });
 }
 
+const PRODUCER_SOURCES = ['mic', 'webcam', 'screen'];
+
 /**
  * Creates a producer for the peer's outgoing track and announces it to the
- * rest of the group so they can consume it.
+ * rest of the group so they can consume it. The producer's source (mic,
+ * webcam or screen) travels in appData so viewers can render screen shares
+ * as separate tiles.
  * @param {ServerContext} context - Shared server context.
  * @param {Socket} socket - The requesting socket.
- * @param {{ transportId: string, kind: types.MediaKind, rtpParameters: types.RtpParameters }} data - Produce payload.
+ * @param {{ transportId: string, kind: types.MediaKind, rtpParameters: types.RtpParameters, appData?: { source?: string } }} data - Produce payload.
  * @param {Callback} callback - Acknowledgement callback.
  * @returns {Promise<void>} Resolves when the producer is created.
  */
-async function handleProduce(context: ServerContext, socket: Socket, data: { transportId: string; kind: types.MediaKind; rtpParameters: types.RtpParameters }, callback: Callback): Promise<void> {
-  const { transportId, kind, rtpParameters } = data;
+async function handleProduce(context: ServerContext, socket: Socket, data: { transportId: string; kind: types.MediaKind; rtpParameters: types.RtpParameters; appData?: { source?: string } }, callback: Callback): Promise<void> {
+  const { transportId, kind, rtpParameters, appData } = data;
   const { room, peer } = getRoomAndPeer(context, socket);
   const transport = peer.getTransport(transportId);
   if (!transport) {
     throw new Error(`Transport not found: ${transportId}`);
   }
-  const producer = await transport.produce({ kind, rtpParameters });
+  const source = appData?.source && PRODUCER_SOURCES.includes(appData.source) ? appData.source : 'webcam';
+  const producer = await transport.produce({ kind, rtpParameters, appData: { source } });
   peer.addProducer(producer);
   socket.to(room.id).emit('newProducer', {
     producerId: producer.id,
     peerId: peer.id,
     peerName: peer.name,
-    kind: producer.kind
+    kind: producer.kind,
+    source
   });
   callback({ id: producer.id });
+}
+
+/**
+ * Closes one of the peer's own producers (screen share stop). mediasoup
+ * closes all consumers of it, which notifies viewers via consumerClosed.
+ * @param {ServerContext} context - Shared server context.
+ * @param {Socket} socket - The requesting socket.
+ * @param {{ producerId: string }} data - Close payload.
+ * @param {Callback} callback - Acknowledgement callback.
+ * @returns {Promise<void>} Resolves when the producer is closed.
+ */
+async function handleCloseProducer(context: ServerContext, socket: Socket, data: { producerId: string }, callback: Callback): Promise<void> {
+  const { producerId } = data;
+  const { peer } = getRoomAndPeer(context, socket);
+  if (!peer.closeProducer(producerId)) {
+    throw new Error(`Producer not found: ${producerId}`);
+  }
+  callback({ closed: true });
 }
 
 /**
@@ -193,6 +254,12 @@ async function handleConsume(context: ServerContext, socket: Socket, data: { tra
   }
   const consumer = await transport.consume({ producerId, rtpCapabilities, paused: true });
   peer.addConsumer(consumer);
+  if (consumer.kind === 'video' && consumer.type === 'simulcast') {
+    await consumer.setPreferredLayers({
+      spatialLayer: preferredSpatialLayer(room.getPeers().length),
+      temporalLayer: 2
+    });
+  }
   consumer.on('producerclose', () => {
     socket.emit('consumerClosed', { consumerId: consumer.id });
   });
@@ -270,6 +337,8 @@ function handleDisconnect(context: ServerContext, socket: Socket): void {
     room.close();
     context.rooms.delete(groupId);
     console.log(`Closed empty room for group "${groupId}"`);
+  } else {
+    updatePreferredLayers(room);
   }
 }
 
@@ -284,6 +353,7 @@ export function registerSocketHandlers(context: ServerContext, socket: Socket): 
   socket.on('createTransport', safeHandler('createTransport', (_data, callback) => handleCreateTransport(context, socket, callback)));
   socket.on('connectTransport', safeHandler('connectTransport', (data, callback) => handleConnectTransport(context, socket, data, callback)));
   socket.on('produce', safeHandler('produce', (data, callback) => handleProduce(context, socket, data, callback)));
+  socket.on('closeProducer', safeHandler('closeProducer', (data, callback) => handleCloseProducer(context, socket, data, callback)));
   socket.on('consume', safeHandler('consume', (data, callback) => handleConsume(context, socket, data, callback)));
   socket.on('resumeConsumer', safeHandler('resumeConsumer', (data, callback) => handleResumeConsumer(context, socket, data, callback)));
   socket.on('toggleProducer', safeHandler('toggleProducer', (data, callback) => handleToggleProducer(context, socket, data, callback)));

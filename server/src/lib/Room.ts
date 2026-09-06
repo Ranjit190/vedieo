@@ -9,6 +9,8 @@ export interface ProducerInfo {
   peerId: string;
   peerName: string;
   kind: types.MediaKind;
+  source: string;
+  paused: boolean;
 }
 
 /**
@@ -87,7 +89,9 @@ export default class Room {
           producerId: producer.id,
           peerId: peer.id,
           peerName: peer.name,
-          kind: producer.kind
+          kind: producer.kind,
+          source: (producer.appData.source as string) || 'webcam',
+          paused: producer.paused
         });
       });
     });

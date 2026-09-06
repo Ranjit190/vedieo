@@ -1,6 +1,15 @@
 import { Device, types } from 'mediasoup-client';
 import { Socket } from 'socket.io-client';
 
+export type ProducerSource = 'mic' | 'webcam' | 'screen';
+
+const VIDEO_ENCODINGS: types.RtpEncodingParameters[] = [
+  { scaleResolutionDownBy: 4, maxBitrate: 150000 },
+  { scaleResolutionDownBy: 2, maxBitrate: 400000 },
+  { scaleResolutionDownBy: 1, maxBitrate: 1200000 }
+];
+const SCREEN_ENCODINGS: types.RtpEncodingParameters[] = [{ maxBitrate: 1500000 }];
+
 /**
  * A remote producer announced by the server.
  */
@@ -9,27 +18,72 @@ export interface RemoteProducerInfo {
   peerId: string;
   peerName: string;
   kind: types.MediaKind;
+  source: ProducerSource;
+  paused?: boolean;
+}
+
+/**
+ * A peer's current mute state, shown as avatar/badge UI on their tile.
+ */
+export interface PeerAVState {
+  micMuted: boolean;
+  camOff: boolean;
+}
+
+/**
+ * One rendered tile: a peer's camera+mic stream, or a peer's screen share.
+ */
+export interface RemoteTile {
+  tileKey: string;
+  peerId: string;
+  name: string;
+  stream: MediaStream;
+  isScreen: boolean;
 }
 
 /**
  * Callbacks the UI layer provides to react to room events.
  */
 export interface RoomClientCallbacks {
-  onRemoteStream: (peerId: string, name: string, stream: MediaStream) => void;
-  onPeerLeft: (peerId: string) => void;
+  onTileUpdated: (tile: RemoteTile) => void;
+  onTileRemoved: (tileKey: string) => void;
+  onPeerStateChanged: (peerId: string, state: PeerAVState) => void;
   onError: (message: string) => void;
 }
 
 interface ConsumerEntry {
   consumer: types.Consumer;
   peerId: string;
+  tileKey: string;
+}
+
+interface ProduceOptions {
+  encodings?: types.RtpEncodingParameters[];
+  codecOptions?: types.ProducerCodecOptions;
+}
+
+/**
+ * Returns the encoder settings for a producer source: Opus DTX/FEC for the
+ * microphone, three simulcast layers for the webcam and a single sharp
+ * layer for screen shares.
+ * @param {ProducerSource} source - The producer source.
+ * @returns {ProduceOptions} Encodings and codec options for that source.
+ */
+function produceOptionsFor(source: ProducerSource): ProduceOptions {
+  if (source === 'mic') {
+    return { codecOptions: { opusDtx: true, opusFec: true } };
+  }
+  if (source === 'screen') {
+    return { encodings: SCREEN_ENCODINGS, codecOptions: { videoGoogleStartBitrate: 800 } };
+  }
+  return { encodings: VIDEO_ENCODINGS, codecOptions: { videoGoogleStartBitrate: 400 } };
 }
 
 /**
  * Encapsulates all mediasoup-client logic for one call: device loading,
- * transport creation, producing local tracks and consuming remote ones.
- * The React layer only calls join/leave/toggle and receives streams via
- * the provided callbacks.
+ * transport creation, producing local tracks (mic/webcam/screen) and
+ * consuming remote ones grouped into per-peer tiles. The React layer calls
+ * join/leave/produce/toggle and receives tiles via the provided callbacks.
  */
 export default class RoomClient {
   private readonly socket: Socket;
@@ -37,10 +91,11 @@ export default class RoomClient {
   private readonly device = new Device();
   private sendTransport: types.Transport | null = null;
   private recvTransport: types.Transport | null = null;
-  private readonly producers = new Map<types.MediaKind, types.Producer>();
+  private readonly producers = new Map<ProducerSource, types.Producer>();
   private readonly consumers = new Map<string, ConsumerEntry>();
-  private readonly remoteStreams = new Map<string, MediaStream>();
+  private readonly tileStreams = new Map<string, MediaStream>();
   private readonly peerNames = new Map<string, string>();
+  private readonly peerStates = new Map<string, PeerAVState>();
   private readonly pendingProducers: RemoteProducerInfo[] = [];
   private ready = false;
   private closed = false;
@@ -75,14 +130,14 @@ export default class RoomClient {
   }
 
   /**
-   * Joins a group: loads the device, creates both transports, produces the
-   * local tracks and consumes every producer already in the room.
+   * Joins a group: loads the device, creates both transports and consumes
+   * every producer already in the room. Local tracks are produced separately
+   * via produceTrack so joining with camera/mic off is possible.
    * @param {string} groupId - The group id to join.
    * @param {string} name - The user's display name.
-   * @param {MediaStream} localStream - The user's camera/microphone stream.
    * @returns {Promise<void>} Resolves when fully joined.
    */
-  async join(groupId: string, name: string, localStream: MediaStream): Promise<void> {
+  async join(groupId: string, name: string): Promise<void> {
     if (!this.socket.connected) {
       this.socket.connect();
     }
@@ -94,7 +149,6 @@ export default class RoomClient {
     await this.device.load({ routerRtpCapabilities: joinResponse.rtpCapabilities });
     this.sendTransport = await this.createTransport('send');
     this.recvTransport = await this.createTransport('recv');
-    await this.produceLocalTracks(localStream);
     this.ready = true;
     const initialProducers = [...joinResponse.producers, ...this.pendingProducers.splice(0)];
     for (const producerInfo of initialProducers) {
@@ -121,8 +175,8 @@ export default class RoomClient {
     });
     if (direction === 'send') {
       transport.on('produce', (payload, callback, errback) => {
-        const { kind, rtpParameters } = payload;
-        this.request('produce', { transportId: transport.id, kind, rtpParameters })
+        const { kind, rtpParameters, appData } = payload;
+        this.request('produce', { transportId: transport.id, kind, rtpParameters, appData })
           .then((response) => callback({ id: response.id }))
           .catch((error) => errback(error as Error));
       });
@@ -131,35 +185,97 @@ export default class RoomClient {
   }
 
   /**
-   * Produces the audio and video tracks of the local stream on the send
-   * transport.
-   * @param {MediaStream} localStream - The user's camera/microphone stream.
-   * @returns {Promise<void>} Resolves when all tracks are produced.
+   * Produces one local track on the send transport with encoder settings
+   * matching its source. No-op when that source is already produced.
+   * @param {ProducerSource} source - What the track is (mic/webcam/screen).
+   * @param {MediaStreamTrack} track - The track to send.
+   * @returns {Promise<void>} Resolves when the producer is live.
    */
-  private async produceLocalTracks(localStream: MediaStream): Promise<void> {
+  async produceTrack(source: ProducerSource, track: MediaStreamTrack): Promise<void> {
     if (!this.sendTransport) {
       throw new Error('Send transport is not ready');
     }
-    const audioTrack = localStream.getAudioTracks()[0];
-    const videoTrack = localStream.getVideoTracks()[0];
-    if (audioTrack) {
-      const audioProducer = await this.sendTransport.produce({ track: audioTrack });
-      this.producers.set('audio', audioProducer);
+    if (this.producers.has(source)) {
+      return;
     }
-    if (videoTrack) {
-      const videoProducer = await this.sendTransport.produce({ track: videoTrack });
-      this.producers.set('video', videoProducer);
+    const options = produceOptionsFor(source);
+    const producer = await this.sendTransport.produce({
+      track,
+      encodings: options.encodings,
+      codecOptions: options.codecOptions,
+      appData: { source }
+    });
+    this.producers.set(source, producer);
+  }
+
+  /**
+   * Whether a producer for the given source is active.
+   * @param {ProducerSource} source - The producer source.
+   * @returns {boolean} True when producing.
+   */
+  hasProducer(source: ProducerSource): boolean {
+    return this.producers.has(source);
+  }
+
+  /**
+   * Swaps the track of an active producer, e.g. when the microphone device
+   * changes after plugging in a headset. Seamless for viewers.
+   * @param {ProducerSource} source - The producer to update.
+   * @param {MediaStreamTrack} track - The replacement track.
+   * @returns {Promise<void>} Resolves when the track is replaced.
+   */
+  async replaceTrack(source: ProducerSource, track: MediaStreamTrack): Promise<void> {
+    const producer = this.producers.get(source);
+    if (!producer) {
+      return;
     }
+    await producer.replaceTrack({ track });
+  }
+
+  /**
+   * Closes a producer locally and on the server (e.g. stopping a screen
+   * share). Viewers' consumers close automatically.
+   * @param {ProducerSource} source - The producer to close.
+   * @returns {Promise<void>} Resolves when closed on the server.
+   */
+  async closeProducer(source: ProducerSource): Promise<void> {
+    const producer = this.producers.get(source);
+    if (!producer) {
+      return;
+    }
+    producer.close();
+    this.producers.delete(source);
+    await this.request('closeProducer', { producerId: producer.id });
+  }
+
+  /**
+   * Pauses or resumes one of the local producers (mute / camera off) both
+   * locally and on the server.
+   * @param {ProducerSource} source - Which producer to toggle.
+   * @param {boolean} paused - True to pause, false to resume.
+   * @returns {Promise<void>} Resolves when the state is applied.
+   */
+  async setProducerPaused(source: ProducerSource, paused: boolean): Promise<void> {
+    const producer = this.producers.get(source);
+    if (!producer) {
+      return;
+    }
+    if (paused) {
+      producer.pause();
+    } else {
+      producer.resume();
+    }
+    await this.request('toggleProducer', { producerId: producer.id, paused });
   }
 
   /**
    * Consumes one remote producer: asks the server for a paused consumer,
-   * attaches its track to the owning peer's stream and resumes it.
+   * attaches its track to the owning tile and resumes it.
    * @param {RemoteProducerInfo} producerInfo - The remote producer to consume.
    * @returns {Promise<void>} Resolves when the consumer is live.
    */
   private async consumeProducer(producerInfo: RemoteProducerInfo): Promise<void> {
-    const { producerId, peerId, peerName, kind } = producerInfo;
+    const { producerId, peerId, peerName, kind, source } = producerInfo;
     if (!this.recvTransport || this.closed) {
       return;
     }
@@ -175,27 +291,49 @@ export default class RoomClient {
       kind: data.kind ?? kind,
       rtpParameters: data.rtpParameters
     });
-    this.consumers.set(consumer.id, { consumer, peerId });
-    this.addTrackToPeer(peerId, consumer.track);
+    const tileKey = source === 'screen' ? `${peerId}:screen` : `${peerId}:cam`;
+    this.consumers.set(consumer.id, { consumer, peerId, tileKey });
+    this.addTrackToTile(tileKey, peerId, consumer.track);
+    if (source !== 'screen' && producerInfo.paused) {
+      this.updatePeerState(peerId, consumer.kind, true);
+    }
     await this.request('resumeConsumer', { consumerId: consumer.id });
   }
 
   /**
-   * Adds a track to the MediaStream of a peer and notifies the UI. A new
+   * Adds a track to a tile's MediaStream and notifies the UI. A new
    * MediaStream instance is built each time so the video element re-attaches
    * srcObject — browsers do not reliably start playing a track that is added
    * to a stream which is already attached and playing.
+   * @param {string} tileKey - The tile to update.
    * @param {string} peerId - The owning peer's id.
    * @param {MediaStreamTrack} track - The consumed track.
    * @returns {void}
    */
-  private addTrackToPeer(peerId: string, track: MediaStreamTrack): void {
-    const existingStream = this.remoteStreams.get(peerId);
+  private addTrackToTile(tileKey: string, peerId: string, track: MediaStreamTrack): void {
+    const existingStream = this.tileStreams.get(tileKey);
     const tracks = existingStream ? [...existingStream.getTracks(), track] : [track];
     const stream = new MediaStream(tracks);
-    this.remoteStreams.set(peerId, stream);
+    this.tileStreams.set(tileKey, stream);
+    this.emitTile(tileKey, peerId, stream);
+  }
+
+  /**
+   * Sends the current state of a tile to the UI.
+   * @param {string} tileKey - The tile key.
+   * @param {string} peerId - The owning peer's id.
+   * @param {MediaStream} stream - The tile's stream.
+   * @returns {void}
+   */
+  private emitTile(tileKey: string, peerId: string, stream: MediaStream): void {
     const name = this.peerNames.get(peerId) || 'Guest';
-    this.callbacks.onRemoteStream(peerId, name, stream);
+    this.callbacks.onTileUpdated({
+      tileKey,
+      peerId,
+      name,
+      stream,
+      isScreen: tileKey.endsWith(':screen')
+    });
   }
 
   /**
@@ -222,10 +360,31 @@ export default class RoomClient {
     this.socket.on('consumerClosed', (data: { consumerId: string }) => {
       this.removeConsumer(data.consumerId);
     });
+    this.socket.on('producerToggled', (data: { peerId: string; kind: types.MediaKind; paused: boolean }) => {
+      this.updatePeerState(data.peerId, data.kind, data.paused);
+    });
   }
 
   /**
-   * Cleans up all state for a peer that left and notifies the UI.
+   * Records that a peer muted/unmuted their mic or camera and notifies the
+   * UI so their tile can show an avatar or muted-mic badge.
+   * @param {string} peerId - The peer whose state changed.
+   * @param {types.MediaKind} kind - Which producer was toggled.
+   * @param {boolean} paused - True when muted / camera off.
+   * @returns {void}
+   */
+  private updatePeerState(peerId: string, kind: types.MediaKind, paused: boolean): void {
+    const state = this.peerStates.get(peerId) || { micMuted: false, camOff: false };
+    const nextState: PeerAVState = {
+      micMuted: kind === 'audio' ? paused : state.micMuted,
+      camOff: kind === 'video' ? paused : state.camOff
+    };
+    this.peerStates.set(peerId, nextState);
+    this.callbacks.onPeerStateChanged(peerId, nextState);
+  }
+
+  /**
+   * Cleans up all state for a peer that left and removes its tiles.
    * @param {string} peerId - The peer that left.
    * @returns {void}
    */
@@ -236,14 +395,20 @@ export default class RoomClient {
         this.consumers.delete(consumerId);
       }
     });
-    this.remoteStreams.delete(peerId);
+    this.tileStreams.forEach((_stream, tileKey) => {
+      if (tileKey.startsWith(`${peerId}:`)) {
+        this.tileStreams.delete(tileKey);
+        this.callbacks.onTileRemoved(tileKey);
+      }
+    });
     this.peerNames.delete(peerId);
-    this.callbacks.onPeerLeft(peerId);
+    this.peerStates.delete(peerId);
   }
 
   /**
-   * Closes a single consumer (its producer closed server-side) and removes
-   * its track from the owning peer's stream.
+   * Closes a single consumer (its producer closed server-side), removes its
+   * track from the tile and removes the tile entirely when it has no tracks
+   * left (e.g. a stopped screen share).
    * @param {string} consumerId - The closed consumer's id.
    * @returns {void}
    */
@@ -254,30 +419,19 @@ export default class RoomClient {
     }
     entry.consumer.close();
     this.consumers.delete(consumerId);
-    const stream = this.remoteStreams.get(entry.peerId);
-    if (stream) {
-      stream.removeTrack(entry.consumer.track);
-    }
-  }
-
-  /**
-   * Pauses or resumes one of the local producers (microphone or camera)
-   * both locally and on the server.
-   * @param {types.MediaKind} kind - Which producer to toggle ('audio' | 'video').
-   * @param {boolean} paused - True to pause, false to resume.
-   * @returns {Promise<void>} Resolves when the state is applied.
-   */
-  async setProducerPaused(kind: types.MediaKind, paused: boolean): Promise<void> {
-    const producer = this.producers.get(kind);
-    if (!producer) {
+    const stream = this.tileStreams.get(entry.tileKey);
+    if (!stream) {
       return;
     }
-    if (paused) {
-      producer.pause();
-    } else {
-      producer.resume();
+    const remaining = stream.getTracks().filter((track) => track !== entry.consumer.track);
+    if (remaining.length === 0) {
+      this.tileStreams.delete(entry.tileKey);
+      this.callbacks.onTileRemoved(entry.tileKey);
+      return;
     }
-    await this.request('toggleProducer', { producerId: producer.id, paused });
+    const nextStream = new MediaStream(remaining);
+    this.tileStreams.set(entry.tileKey, nextStream);
+    this.emitTile(entry.tileKey, entry.peerId, nextStream);
   }
 
   /**
@@ -291,8 +445,8 @@ export default class RoomClient {
     this.recvTransport?.close();
     this.producers.clear();
     this.consumers.clear();
-    this.remoteStreams.clear();
-    ['newProducer', 'peerJoined', 'peerLeft', 'consumerClosed'].forEach((event) => {
+    this.tileStreams.clear();
+    ['newProducer', 'peerJoined', 'peerLeft', 'consumerClosed', 'producerToggled'].forEach((event) => {
       this.socket.off(event);
     });
     this.socket.disconnect();

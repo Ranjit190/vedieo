@@ -1,14 +1,15 @@
 'use client';
 
-import { Suspense, useEffect, useRef } from 'react';
+import { Suspense, useState } from 'react';
 import { useParams, useRouter, useSearchParams } from 'next/navigation';
 import Controls from '@/components/Controls';
+import Lobby from '@/components/Lobby';
 import VideoGrid from '@/components/VideoGrid';
-import { useMediasoup } from '@/hooks/useMediasoup';
+import { JoinOptions, useMediasoup } from '@/hooks/useMediasoup';
 
 /**
- * The call screen for one group: joins the group on mount, renders the
- * video grid of all participants and the control bar.
+ * The call screen for one group: shows the lobby (name + device choices)
+ * first, then the video grid with controls and an invite-link button.
  * @returns {JSX.Element} The room content.
  */
 function RoomContent() {
@@ -16,20 +17,32 @@ function RoomContent() {
   const searchParams = useSearchParams();
   const router = useRouter();
   const groupId = decodeURIComponent(params.groupId);
-  const name = searchParams.get('name') || '';
-  const joinAttempted = useRef(false);
-  const { localStream, remotePeers, joined, joining, error, micOn, camOn, join, leave, toggleMic, toggleCam } = useMediasoup();
+  const initialName = searchParams.get('name') || '';
+  const [displayName, setDisplayName] = useState('');
+  const [copied, setCopied] = useState(false);
+  const { localStream, remoteTiles, peerStates, joined, joining, error, micOn, camOn, screenSharing, join, leave, toggleMic, toggleCam, toggleScreenShare } = useMediasoup();
 
-  useEffect(() => {
-    if (!name) {
-      router.replace('/');
-      return;
-    }
-    if (!joinAttempted.current) {
-      joinAttempted.current = true;
-      join(groupId, name);
-    }
-  }, [groupId, name, join, router]);
+  /**
+   * Joins the call with the lobby's choices.
+   * @param {JoinOptions} options - Name, device ids and initial mic/cam state.
+   * @returns {void}
+   */
+  function handleJoin(options: JoinOptions): void {
+    setDisplayName(options.name);
+    join(groupId, options);
+  }
+
+  /**
+   * Copies the room's invite link so others can join with just their name.
+   * @returns {void}
+   */
+  function copyInvite(): void {
+    const inviteUrl = `${window.location.origin}/room/${encodeURIComponent(groupId)}`;
+    navigator.clipboard.writeText(inviteUrl).then(() => {
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    });
+  }
 
   /**
    * Leaves the call and returns to the landing page.
@@ -44,23 +57,35 @@ function RoomContent() {
     <main className="room">
       <header className="room-header">
         <h2>Group: {groupId}</h2>
-        <span>{remotePeers.size + (joined ? 1 : 0)} participant(s)</span>
+        {joined && (
+          <button type="button" className="invite-btn" onClick={copyInvite}>
+            {copied ? 'Copied!' : 'Copy invite link'}
+          </button>
+        )}
       </header>
       {error && <div className="banner error">{error}</div>}
-      {joining && <div className="banner">Joining the call…</div>}
-      <VideoGrid
-        localStream={localStream}
-        localName={name}
-        remotePeers={Array.from(remotePeers.values())}
-      />
-      {joined && (
-        <Controls
-          micOn={micOn}
-          camOn={camOn}
-          onToggleMic={toggleMic}
-          onToggleCam={toggleCam}
-          onLeave={handleLeave}
-        />
+      {!joined ? (
+        <Lobby groupId={groupId} initialName={initialName} joining={joining} onJoin={handleJoin} />
+      ) : (
+        <>
+          <VideoGrid
+            localStream={localStream}
+            localName={displayName}
+            micOn={micOn}
+            camOn={camOn}
+            tiles={Array.from(remoteTiles.values())}
+            peerStates={peerStates}
+          />
+          <Controls
+            micOn={micOn}
+            camOn={camOn}
+            screenSharing={screenSharing}
+            onToggleMic={toggleMic}
+            onToggleCam={toggleCam}
+            onToggleScreenShare={toggleScreenShare}
+            onLeave={handleLeave}
+          />
+        </>
       )}
     </main>
   );
