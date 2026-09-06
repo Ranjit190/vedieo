@@ -1,7 +1,8 @@
 'use client';
 
+import { useEffect } from 'react';
 import PeerVideo from '@/components/PeerVideo';
-import { PeerAVState, RemoteTile } from '@/hooks/useMediasoup';
+import { PeerAVState, RemoteTile, TileRole } from '@/hooks/useMediasoup';
 
 interface VideoGridProps {
   localStream: MediaStream | null;
@@ -12,6 +13,7 @@ interface VideoGridProps {
   peerStates: Map<string, PeerAVState>;
   screenSharing: boolean;
   localScreenStream: MediaStream | null;
+  onTileRoles: (roles: Map<string, TileRole>) => void;
 }
 
 interface StageProps {
@@ -86,12 +88,25 @@ function Stage(props: StageProps) {
  * @returns {JSX.Element} The call layout.
  */
 export default function VideoGrid(props: VideoGridProps) {
-  const { localStream, localName, micOn, camOn, tiles, peerStates, screenSharing, localScreenStream } = props;
+  const { localStream, localName, micOn, camOn, tiles, peerStates, screenSharing, localScreenStream, onTileRoles } = props;
   const screenTiles = tiles.filter((tile) => tile.isScreen);
   const camTiles = tiles.filter((tile) => !tile.isScreen);
   const screenTile = screenTiles[0] ?? null;
   const stripTiles = screenTile ? [...screenTiles.slice(1), ...camTiles] : [];
   const alone = tiles.length === 0;
+
+  useEffect(() => {
+    const roles = new Map<string, TileRole>();
+    if (screenTile) {
+      roles.set(screenTile.tileKey, 'stage');
+      stripTiles.forEach((tile) => roles.set(tile.tileKey, 'thumb'));
+    } else {
+      camTiles.forEach((tile) => roles.set(tile.tileKey, camTiles.length === 1 ? 'stage' : 'grid'));
+    }
+    onTileRoles(roles);
+    // tiles-derived arrays change identity every render; role sync dedupes downstream
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tiles, onTileRoles]);
   return (
     <div className="stage-wrap">
       {stripTiles.length > 0 && (

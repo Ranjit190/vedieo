@@ -16,40 +16,27 @@ export interface ServerContext {
 
 type Callback = (response: Record<string, unknown>) => void;
 
-const FULL_QUALITY_MAX_PEERS = 2;
-const MID_QUALITY_MAX_PEERS = 4;
-
 /**
- * Picks the simulcast spatial layer viewers should receive based on room
- * size: full quality for 1:1 calls, medium for small groups, lowest for
- * large grids where every tile is rendered small anyway.
- * @param {number} peerCount - Number of peers currently in the room.
- * @returns {number} The preferred spatial layer (0 = lowest, 2 = highest).
+ * Whether a consumer carries layered video (simulcast or SVC) and therefore
+ * supports preferred-layer selection.
+ * @param {types.Consumer} consumer - The consumer to check.
+ * @returns {boolean} True for layered video consumers.
  */
-function preferredSpatialLayer(peerCount: number): number {
-  if (peerCount <= FULL_QUALITY_MAX_PEERS) {
-    return 2;
-  }
-  return peerCount <= MID_QUALITY_MAX_PEERS ? 1 : 0;
+function isLayeredVideoConsumer(consumer: types.Consumer): boolean {
+  return consumer.kind === 'video' && (consumer.type === 'simulcast' || consumer.type === 'svc');
 }
 
 /**
- * Re-applies the preferred simulcast layer on every video consumer in a
- * room. Called when the room size changes so quality scales with grid size.
- * @param {Room} room - The room to update.
- * @returns {void}
+ * Clamps a requested layer index to the valid 0–2 range.
+ * @param {unknown} layer - The requested layer.
+ * @param {number} fallback - Value used when the request is not a number.
+ * @returns {number} A safe layer index.
  */
-function updatePreferredLayers(room: Room): void {
-  const spatialLayer = preferredSpatialLayer(room.getPeers().length);
-  room.getPeers().forEach((peer) => {
-    peer.getConsumers().forEach((consumer) => {
-      if (consumer.kind === 'video' && consumer.type === 'simulcast') {
-        consumer.setPreferredLayers({ spatialLayer, temporalLayer: 2 }).catch((error: Error) => {
-          console.error(`Failed to set preferred layers: ${error.message}`);
-        });
-      }
-    });
-  });
+function clampLayer(layer: unknown, fallback: number): number {
+  if (typeof layer !== 'number' || Number.isNaN(layer)) {
+    return fallback;
+  }
+  return Math.min(2, Math.max(0, Math.floor(layer)));
 }
 
 /**
@@ -139,7 +126,6 @@ async function handleJoinRoom(context: ServerContext, socket: Socket, data: { gr
     producers: room.getProducerList(socket.id),
     peers
   });
-  updatePreferredLayers(room);
   console.log(`Peer "${name}" [${socket.id}] joined group "${groupId}"`);
 }
 
@@ -254,11 +240,8 @@ async function handleConsume(context: ServerContext, socket: Socket, data: { tra
   }
   const consumer = await transport.consume({ producerId, rtpCapabilities, paused: true });
   peer.addConsumer(consumer);
-  if (consumer.kind === 'video' && consumer.type === 'simulcast') {
-    await consumer.setPreferredLayers({
-      spatialLayer: preferredSpatialLayer(room.getPeers().length),
-      temporalLayer: 2
-    });
+  if (isLayeredVideoConsumer(consumer)) {
+    await consumer.setPreferredLayers({ spatialLayer: 1, temporalLayer: 2 });
   }
   consumer.on('producerclose', () => {
     socket.emit('consumerClosed', { consumerId: consumer.id });
@@ -269,6 +252,54 @@ async function handleConsume(context: ServerContext, socket: Socket, data: { tra
     kind: consumer.kind,
     rtpParameters: consumer.rtpParameters
   });
+}
+
+/**
+ * Applies the quality layers a viewer requests for one of its consumers,
+ * driven by how large that tile is rendered (stage / grid / thumbnail).
+ * Non-layered consumers (e.g. single-layer screen shares) are a no-op.
+ * @param {ServerContext} context - Shared server context.
+ * @param {Socket} socket - The requesting socket.
+ * @param {{ consumerId: string, spatialLayer: number, temporalLayer: number }} data - Layer request.
+ * @param {Callback} callback - Acknowledgement callback.
+ * @returns {Promise<void>} Resolves when the layers are applied.
+ */
+async function handleSetConsumerLayers(context: ServerContext, socket: Socket, data: { consumerId: string; spatialLayer: number; temporalLayer: number }, callback: Callback): Promise<void> {
+  const { consumerId, spatialLayer, temporalLayer } = data;
+  const { peer } = getRoomAndPeer(context, socket);
+  const consumer = peer.getConsumer(consumerId);
+  if (!consumer) {
+    throw new Error(`Consumer not found: ${consumerId}`);
+  }
+  if (!isLayeredVideoConsumer(consumer)) {
+    callback({ applied: false });
+    return;
+  }
+  await consumer.setPreferredLayers({
+    spatialLayer: clampLayer(spatialLayer, 2),
+    temporalLayer: clampLayer(temporalLayer, 2)
+  });
+  callback({ applied: true });
+}
+
+/**
+ * Pauses a consumer, e.g. while the viewer's tab is hidden, so no video
+ * bytes are sent for it.
+ * @param {ServerContext} context - Shared server context.
+ * @param {Socket} socket - The requesting socket.
+ * @param {{ consumerId: string }} data - Pause payload.
+ * @param {Callback} callback - Acknowledgement callback.
+ * @returns {Promise<void>} Resolves when the consumer is paused.
+ */
+async function handlePauseConsumer(context: ServerContext, socket: Socket, data: { consumerId: string }, callback: Callback): Promise<void> {
+  const { consumerId } = data;
+  const { peer } = getRoomAndPeer(context, socket);
+  const consumer = peer.getConsumer(consumerId);
+  if (!consumer) {
+    throw new Error(`Consumer not found: ${consumerId}`);
+  }
+  await consumer.pause();
+  callback({ paused: true });
 }
 
 /**
@@ -337,8 +368,6 @@ function handleDisconnect(context: ServerContext, socket: Socket): void {
     room.close();
     context.rooms.delete(groupId);
     console.log(`Closed empty room for group "${groupId}"`);
-  } else {
-    updatePreferredLayers(room);
   }
 }
 
@@ -356,6 +385,8 @@ export function registerSocketHandlers(context: ServerContext, socket: Socket): 
   socket.on('closeProducer', safeHandler('closeProducer', (data, callback) => handleCloseProducer(context, socket, data, callback)));
   socket.on('consume', safeHandler('consume', (data, callback) => handleConsume(context, socket, data, callback)));
   socket.on('resumeConsumer', safeHandler('resumeConsumer', (data, callback) => handleResumeConsumer(context, socket, data, callback)));
+  socket.on('pauseConsumer', safeHandler('pauseConsumer', (data, callback) => handlePauseConsumer(context, socket, data, callback)));
+  socket.on('setConsumerLayers', safeHandler('setConsumerLayers', (data, callback) => handleSetConsumerLayers(context, socket, data, callback)));
   socket.on('toggleProducer', safeHandler('toggleProducer', (data, callback) => handleToggleProducer(context, socket, data, callback)));
   socket.on('disconnect', () => handleDisconnect(context, socket));
 }

@@ -8,7 +8,23 @@ const VIDEO_ENCODINGS: types.RtpEncodingParameters[] = [
   { scaleResolutionDownBy: 2, maxBitrate: 400000 },
   { scaleResolutionDownBy: 1, maxBitrate: 1200000 }
 ];
+const VP9_SVC_ENCODINGS: types.RtpEncodingParameters[] = [
+  { scalabilityMode: 'L3T3_KEY', maxBitrate: 1200000 }
+];
 const SCREEN_ENCODINGS: types.RtpEncodingParameters[] = [{ maxBitrate: 1500000 }];
+
+/**
+ * How a tile is currently rendered, which decides the video quality layers
+ * requested for its consumers: the big stage, a grid cell, or a small
+ * thumbnail (filmstrip / corner).
+ */
+export type TileRole = 'stage' | 'grid' | 'thumb';
+
+const LAYERS_BY_ROLE: Record<TileRole, { spatialLayer: number; temporalLayer: number }> = {
+  stage: { spatialLayer: 2, temporalLayer: 2 },
+  grid: { spatialLayer: 1, temporalLayer: 2 },
+  thumb: { spatialLayer: 0, temporalLayer: 1 }
+};
 
 /**
  * A remote producer announced by the server.
@@ -60,23 +76,7 @@ interface ConsumerEntry {
 interface ProduceOptions {
   encodings?: types.RtpEncodingParameters[];
   codecOptions?: types.ProducerCodecOptions;
-}
-
-/**
- * Returns the encoder settings for a producer source: Opus DTX/FEC for the
- * microphone, three simulcast layers for the webcam and a single sharp
- * layer for screen shares.
- * @param {ProducerSource} source - The producer source.
- * @returns {ProduceOptions} Encodings and codec options for that source.
- */
-function produceOptionsFor(source: ProducerSource): ProduceOptions {
-  if (source === 'mic') {
-    return { codecOptions: { opusDtx: true, opusFec: true } };
-  }
-  if (source === 'screen') {
-    return { encodings: SCREEN_ENCODINGS, codecOptions: { videoGoogleStartBitrate: 800 } };
-  }
-  return { encodings: VIDEO_ENCODINGS, codecOptions: { videoGoogleStartBitrate: 400 } };
+  codec?: types.RtpCodecCapability;
 }
 
 /**
@@ -96,6 +96,8 @@ export default class RoomClient {
   private readonly tileStreams = new Map<string, MediaStream>();
   private readonly peerNames = new Map<string, string>();
   private readonly peerStates = new Map<string, PeerAVState>();
+  private readonly tileRoles = new Map<string, TileRole>();
+  private readonly sentLayers = new Map<string, string>();
   private readonly pendingProducers: RemoteProducerInfo[] = [];
   private ready = false;
   private closed = false;
@@ -198,14 +200,39 @@ export default class RoomClient {
     if (this.producers.has(source)) {
       return;
     }
-    const options = produceOptionsFor(source);
+    const options = this.produceOptions(source);
     const producer = await this.sendTransport.produce({
       track,
       encodings: options.encodings,
       codecOptions: options.codecOptions,
+      codec: options.codec,
       appData: { source }
     });
     this.producers.set(source, producer);
+  }
+
+  /**
+   * Returns the encoder settings for a producer source: Opus DTX/FEC capped
+   * at 24 kbps for the microphone; VP9 K-SVC (one stream carrying three
+   * quality layers) for the webcam when the router and browser support VP9,
+   * with VP8 simulcast as the fallback; a single sharp layer for screens.
+   * @param {ProducerSource} source - The producer source.
+   * @returns {ProduceOptions} Encodings, codec options and codec choice.
+   */
+  private produceOptions(source: ProducerSource): ProduceOptions {
+    if (source === 'mic') {
+      return { codecOptions: { opusDtx: true, opusFec: true, opusMaxAverageBitrate: 24000 } };
+    }
+    if (source === 'screen') {
+      return { encodings: SCREEN_ENCODINGS, codecOptions: { videoGoogleStartBitrate: 800 } };
+    }
+    const vp9 = this.device.recvRtpCapabilities.codecs?.find(
+      (codec) => codec.mimeType.toLowerCase() === 'video/vp9'
+    );
+    if (vp9) {
+      return { encodings: VP9_SVC_ENCODINGS, codecOptions: { videoGoogleStartBitrate: 400 }, codec: vp9 };
+    }
+    return { encodings: VIDEO_ENCODINGS, codecOptions: { videoGoogleStartBitrate: 400 } };
   }
 
   /**
@@ -298,6 +325,63 @@ export default class RoomClient {
       this.updatePeerState(peerId, consumer.kind, true);
     }
     await this.request('resumeConsumer', { consumerId: consumer.id });
+    this.syncConsumerLayers(consumer.id);
+  }
+
+  /**
+   * Records how each tile is currently rendered (stage / grid / thumbnail)
+   * and requests matching quality layers for every affected video consumer.
+   * Called by the UI whenever the layout changes.
+   * @param {Map<string, TileRole>} roles - Tile roles keyed by tile key.
+   * @returns {void}
+   */
+  applyTileRoles(roles: Map<string, TileRole>): void {
+    roles.forEach((role, tileKey) => this.tileRoles.set(tileKey, role));
+    this.consumers.forEach((_entry, consumerId) => this.syncConsumerLayers(consumerId));
+  }
+
+  /**
+   * Sends the preferred layers for one video consumer based on its tile's
+   * role, skipping requests that would repeat the last applied value.
+   * @param {string} consumerId - The consumer to update.
+   * @returns {void}
+   */
+  private syncConsumerLayers(consumerId: string): void {
+    const entry = this.consumers.get(consumerId);
+    if (!entry || entry.consumer.kind !== 'video') {
+      return;
+    }
+    const role = this.tileRoles.get(entry.tileKey) || 'grid';
+    const layers = LAYERS_BY_ROLE[role];
+    const signature = `${layers.spatialLayer}:${layers.temporalLayer}`;
+    if (this.sentLayers.get(consumerId) === signature) {
+      return;
+    }
+    this.sentLayers.set(consumerId, signature);
+    this.request('setConsumerLayers', { consumerId, ...layers }).catch(() => {
+      this.sentLayers.delete(consumerId);
+    });
+  }
+
+  /**
+   * Pauses or resumes every video consumer, e.g. while the viewer's tab is
+   * hidden, so no video data is downloaded for an invisible page. Audio
+   * consumers keep flowing.
+   * @param {boolean} paused - True to pause, false to resume.
+   * @returns {void}
+   */
+  setVideoConsumersPaused(paused: boolean): void {
+    this.consumers.forEach((entry) => {
+      if (entry.consumer.kind !== 'video' || entry.consumer.closed) {
+        return;
+      }
+      if (paused) {
+        entry.consumer.pause();
+      } else {
+        entry.consumer.resume();
+      }
+      this.request(paused ? 'pauseConsumer' : 'resumeConsumer', { consumerId: entry.consumer.id }).catch(() => {});
+    });
   }
 
   /**
@@ -419,6 +503,7 @@ export default class RoomClient {
     }
     entry.consumer.close();
     this.consumers.delete(consumerId);
+    this.sentLayers.delete(consumerId);
     const stream = this.tileStreams.get(entry.tileKey);
     if (!stream) {
       return;
@@ -446,6 +531,8 @@ export default class RoomClient {
     this.producers.clear();
     this.consumers.clear();
     this.tileStreams.clear();
+    this.tileRoles.clear();
+    this.sentLayers.clear();
     ['newProducer', 'peerJoined', 'peerLeft', 'consumerClosed', 'producerToggled'].forEach((event) => {
       this.socket.off(event);
     });

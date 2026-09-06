@@ -52,6 +52,15 @@ const config = {
       },
       {
         kind: 'video',
+        mimeType: 'video/VP9',
+        clockRate: 90000,
+        parameters: {
+          'profile-id': 0,
+          'x-google-start-bitrate': 400
+        }
+      },
+      {
+        kind: 'video',
         mimeType: 'video/VP8',
         clockRate: 90000,
         parameters: {

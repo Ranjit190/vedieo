@@ -20,7 +20,7 @@ function RoomContent() {
   const initialName = searchParams.get('name') || '';
   const [displayName, setDisplayName] = useState('');
   const [copied, setCopied] = useState(false);
-  const { localStream, remoteTiles, peerStates, joined, joining, error, micOn, camOn, screenSharing, localScreenStream, join, leave, toggleMic, toggleCam, toggleScreenShare } = useMediasoup();
+  const { localStream, remoteTiles, peerStates, joined, joining, error, micOn, camOn, screenSharing, localScreenStream, join, leave, toggleMic, toggleCam, toggleScreenShare, applyTileRoles } = useMediasoup();
 
   /**
    * Joins the call with the lobby's choices.
@@ -77,6 +77,7 @@ function RoomContent() {
             peerStates={peerStates}
             screenSharing={screenSharing}
             localScreenStream={localScreenStream}
+            onTileRoles={applyTileRoles}
           />
           <Controls
             micOn={micOn}

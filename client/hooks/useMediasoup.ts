@@ -1,10 +1,10 @@
 'use client';
 
 import { useCallback, useEffect, useRef, useState } from 'react';
-import RoomClient, { PeerAVState, RemoteTile } from '@/lib/RoomClient';
+import RoomClient, { PeerAVState, RemoteTile, TileRole } from '@/lib/RoomClient';
 import { getSocket } from '@/lib/socket';
 
-export type { PeerAVState, RemoteTile } from '@/lib/RoomClient';
+export type { PeerAVState, RemoteTile, TileRole } from '@/lib/RoomClient';
 
 /**
  * Options chosen in the lobby before joining a call.
@@ -328,6 +328,16 @@ export function useMediasoup() {
     }
   }, [screenSharing, stopScreenShare]);
 
+  /**
+   * Forwards the current tile roles (stage / grid / thumbnail) to the room
+   * client so each consumer downloads only the quality its tile needs.
+   * @param {Map<string, TileRole>} roles - Tile roles keyed by tile key.
+   * @returns {void}
+   */
+  const applyTileRoles = useCallback((roles: Map<string, TileRole>): void => {
+    clientRef.current?.applyTileRoles(roles);
+  }, []);
+
   useEffect(() => {
     if (!joined) {
       return;
@@ -339,6 +349,19 @@ export function useMediasoup() {
     };
     // scheduleMicRecovery is stable across renders (uses refs only)
     // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [joined]);
+
+  useEffect(() => {
+    if (!joined) {
+      return;
+    }
+    const handler = () => {
+      clientRef.current?.setVideoConsumersPaused(document.hidden);
+    };
+    document.addEventListener('visibilitychange', handler);
+    return () => {
+      document.removeEventListener('visibilitychange', handler);
+    };
   }, [joined]);
 
   useEffect(() => {
@@ -367,6 +390,7 @@ export function useMediasoup() {
     leave,
     toggleMic,
     toggleCam,
-    toggleScreenShare
+    toggleScreenShare,
+    applyTileRoles
   };
 }
